@@ -1,0 +1,34 @@
+# Datasets y capturas de tráfico
+*.pcap
+*.pcapng
+*.csv
+*.zip
+*.gz
+*.tar
+*.tar.gz
+
+# Resultados y salidas generadas
+out/
+outputs/
+results/
+predictions/
+figures_output/
+*.pdf
+*.png
+
+# Entornos virtuales y cachés de Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Archivos del sistema y editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Archivos temporales
+*.tmp
+*.log
