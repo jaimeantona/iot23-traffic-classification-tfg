@@ -1,109 +1,123 @@
 #!/usr/bin/env bash
+#
+# Split large PCAP files into smaller chunks using editcap.
+#
+# Usage:
+#   ./split_dir_por_tamano_editcap.sh <input_root> [threshold_kb] [target_kb] [output_dir_name]
+#
+# The input root may be a single scenario directory or a directory containing
+# several IoT-23 scenarios. Repaired *_fixed.pcap files are preferred when
+# both the original and repaired versions exist.
+
 set -euo pipefail
 
-ROOT="${1:?Uso: split_dir_por_tamano_editcap.sh /ruta/al/escenario_o_root [THRESHOLD_KB] [TARGET_KB] [OUTDIR_NAME]}"
-THRESHOLD_KB="${2:-1000000}"     # si el PCAP pesa más de esto, lo partimos (1.000.000 KB)
-TARGET_KB="${3:-500000}"         # tamaño objetivo por chunk (ej: 500000 KB = ~500MB, 100000 KB = ~100MB)
-OUTDIR_NAME="${4:-chunks_500mb}" # carpeta dentro del mismo dir del pcap
+ROOT="${1:?Usage: split_dir_por_tamano_editcap.sh <input_root> [threshold_kb] [target_kb] [output_dir_name]}"
+THRESHOLD_KB="${2:-1000000}"
+TARGET_KB="${3:-500000}"
+OUTDIR_NAME="${4:-chunks_500mb}"
 
-echo "ROOT=$ROOT"
-echo "THRESHOLD_KB=$THRESHOLD_KB KB | TARGET_KB=$TARGET_KB KB | OUTDIR_NAME=$OUTDIR_NAME"
-echo
+command -v capinfos >/dev/null 2>&1 || {
+  echo "[ERROR] capinfos is not installed or is not available in PATH." >&2
+  exit 2
+}
+command -v editcap >/dev/null 2>&1 || {
+  echo "[ERROR] editcap is not installed or is not available in PATH." >&2
+  exit 2
+}
+command -v du >/dev/null 2>&1 || {
+  echo "[ERROR] du is not installed or is not available in PATH." >&2
+  exit 2
+}
 
-command -v capinfos >/dev/null 2>&1 || { echo "ERROR: falta capinfos. Instala: sudo apt install wireshark-common"; exit 1; }
-command -v editcap  >/dev/null 2>&1 || { echo "ERROR: falta editcap. Instala: sudo apt install wireshark-common"; exit 1; }
-command -v du       >/dev/null 2>&1 || { echo "ERROR: falta du (coreutils)"; exit 1; }
+if [[ ! -d "$ROOT" ]]; then
+  echo "[ERROR] Input root directory not found: $ROOT" >&2
+  exit 2
+fi
 
-# Recorre todos los PCAPs en ROOT (puede ser un escenario o el root de escenarios)
+normalise_packet_count() {
+  local raw="$1"
+  raw="${raw// /}"
+
+  case "$raw" in
+    *k|*K) echo $(( ${raw%[kK]} * 1000 )) ;;
+    *m|*M) echo $(( ${raw%[mM]} * 1000000 )) ;;
+    *g|*G) echo $(( ${raw%[gG]} * 1000000000 )) ;;
+    *)     echo "$raw" ;;
+  esac
+}
+
+echo "[INFO] Input root: $ROOT"
+echo "[INFO] Split threshold: ${THRESHOLD_KB} KB"
+echo "[INFO] Target chunk size: ${TARGET_KB} KB"
+echo "[INFO] Chunk directory name: $OUTDIR_NAME"
+
 find "$ROOT" -type f -name "*.pcap" \
   ! -name "*only15000000.pcap" \
   ! -name "test.pcap" \
-| while read -r PCAP; do
+| while read -r pcap; do
+  pcap_to_use="$pcap"
 
-  # Preferir *_fixed.pcap si existe para el mismo nombre base
-  # (si el PCAP ya es _fixed, se usa tal cual)
-  PCAP_USE="$PCAP"
-  if [[ "$PCAP" != *_fixed.pcap ]]; then
-    FIXED="${PCAP%.pcap}_fixed.pcap"
-    if [[ -f "$FIXED" ]]; then
-      PCAP_USE="$FIXED"
+  if [[ "$pcap" != *_fixed.pcap ]]; then
+    repaired_pcap="${pcap%.pcap}_fixed.pcap"
+    if [[ -f "$repaired_pcap" ]]; then
+      pcap_to_use="$repaired_pcap"
     fi
   fi
 
-  # Tamaño en KB
-  SIZE_KB="$(du -k "$PCAP_USE" | awk '{print $1}')"
-  if [[ -z "${SIZE_KB:-}" ]]; then
-    echo "  [WARN] No pude leer tamaño con du: $PCAP_USE"
+  size_kb="$(du -k "$pcap_to_use" | awk '{print $1}')"
+  if [[ -z "${size_kb:-}" ]]; then
+    echo "[WARNING] Unable to obtain file size: $pcap_to_use" >&2
     continue
   fi
 
-  # Solo split si supera umbral
-  if (( SIZE_KB <= THRESHOLD_KB )); then
+  if (( size_kb <= THRESHOLD_KB )); then
     continue
   fi
 
-  DIR="$(dirname "$PCAP_USE")"
-  BASE="$(basename "$PCAP_USE")"
-  OUTDIR="$DIR/$OUTDIR_NAME"
-  mkdir -p "$OUTDIR"
+  input_dir="$(dirname "$pcap_to_use")"
+  base_name="$(basename "$pcap_to_use")"
+  output_dir="$input_dir/$OUTDIR_NAME"
+  mkdir -p "$output_dir"
 
-  echo "[SPLIT] $PCAP_USE  (${SIZE_KB} KB) -> $OUTDIR"
+  raw_packets="$(capinfos -c "$pcap_to_use" 2>/dev/null \
+    | awk -F: '/Number of packets/ {print $2}' | xargs || true)"
 
-  # ---- PKTS robusto (convierte 73 M / 1264 k / etc a entero) ----
-  PKTS_RAW="$(capinfos -c "$PCAP_USE" 2>/dev/null | awk -F: '/Number of packets/ {print $2}' | xargs || true)"
-  # Normaliza: "73 M" -> "73M", "1264 k"->"1264k"
-  PKTS_RAW="${PKTS_RAW// /}"
-
-  if [[ -z "${PKTS_RAW:-}" ]]; then
-    echo "  [WARN] No pude leer 'Number of packets' con capinfos. Saltando."
+  if [[ -z "${raw_packets:-}" ]]; then
+    echo "[WARNING] Unable to obtain packet count: $pcap_to_use" >&2
     continue
   fi
 
-  case "$PKTS_RAW" in
-    *k) PKTS=$(( ${PKTS_RAW%k} * 1000 )) ;;
-    *K) PKTS=$(( ${PKTS_RAW%K} * 1000 )) ;;
-    *m) PKTS=$(( ${PKTS_RAW%m} * 1000000 )) ;;
-    *M) PKTS=$(( ${PKTS_RAW%M} * 1000000 )) ;;
-    *g) PKTS=$(( ${PKTS_RAW%g} * 1000000000 )) ;;
-    *G) PKTS=$(( ${PKTS_RAW%G} * 1000000000 )) ;;
-    *)  PKTS=$PKTS_RAW ;;
-  esac
-
-  if [[ -z "${PKTS:-}" || "$PKTS" -le 0 ]]; then
-    echo "  [WARN] PKTS inválido (raw='$PKTS_RAW' -> '$PKTS'). Saltando."
-    continue
-  fi
-  # ---------------------------------------------------------------
-
-  SIZE_BYTES=$(( SIZE_KB * 1024 ))
-  TARGET_BYTES=$(( TARGET_KB * 1024 ))
-
-  # Tamaño medio de paquete y pkts por chunk
-  AVG_PKT=$(( SIZE_BYTES / PKTS ))
-  if (( AVG_PKT < 1 )); then AVG_PKT=1; fi
-
-  PKTS_PER_CHUNK=$(( TARGET_BYTES / AVG_PKT ))
-  # Evitar generar millones de ficheros
-  if (( PKTS_PER_CHUNK < 50000 )); then PKTS_PER_CHUNK=50000; fi
-
-  echo "  pkts_total=$PKTS (raw=$PKTS_RAW) | avg_pkt=${AVG_PKT}B | pkts_per_chunk=$PKTS_PER_CHUNK (~${TARGET_KB}KB)"
-
-  # Prefijo de salida
-  PREFIX="$OUTDIR/${BASE%.pcap}_chunkpkts"
-  # Limpieza opcional: si ya existían chunks previos con el mismo prefijo, bórralos
-  # (descomenta si quieres regenerar siempre)
-  # rm -f "$OUTDIR/${BASE%.pcap}_chunkpkts_"*.pcap 2>/dev/null || true
-
-  # Ejecuta split por nº de paquetes
-  if ! editcap -c "$PKTS_PER_CHUNK" "$PCAP_USE" "${PREFIX}.pcap" >/dev/null 2>&1; then
-    echo "  [WARN] editcap falló en $PCAP_USE"
+  packets="$(normalise_packet_count "$raw_packets")"
+  if [[ -z "${packets:-}" || ! "$packets" =~ ^[0-9]+$ || "$packets" -le 0 ]]; then
+    echo "[WARNING] Invalid packet count for $pcap_to_use: $raw_packets" >&2
     continue
   fi
 
-  # Conteo correcto de chunks (editcap crea *_chunkpkts_00000_YYYY...pcap)
-  COUNT="$(find "$OUTDIR" -maxdepth 1 -type f -name "${BASE%.pcap}_chunkpkts_*.pcap" | wc -l | awk '{print $1}')"
-  echo "  chunks_generados=$COUNT"
+  size_bytes=$(( size_kb * 1024 ))
+  target_bytes=$(( TARGET_KB * 1024 ))
+  average_packet_size=$(( size_bytes / packets ))
+  if (( average_packet_size < 1 )); then
+    average_packet_size=1
+  fi
+
+  packets_per_chunk=$(( target_bytes / average_packet_size ))
+  if (( packets_per_chunk < 50000 )); then
+    packets_per_chunk=50000
+  fi
+
+  prefix="$output_dir/${base_name%.pcap}_chunkpkts"
+
+  echo "[INFO] Splitting: $pcap_to_use"
+  echo "[INFO] Packets=$packets | estimated packets/chunk=$packets_per_chunk | output=$output_dir"
+
+  if ! editcap -c "$packets_per_chunk" "$pcap_to_use" "${prefix}.pcap" >/dev/null 2>&1; then
+    echo "[WARNING] editcap failed for: $pcap_to_use" >&2
+    continue
+  fi
+
+  chunk_count="$(find "$output_dir" -maxdepth 1 -type f \
+    -name "${base_name%.pcap}_chunkpkts_*.pcap" | wc -l | awk '{print $1}')"
+  echo "[INFO] Chunks generated: $chunk_count"
 done
 
-echo
-echo "DONE."
+echo "[INFO] Splitting process completed."
