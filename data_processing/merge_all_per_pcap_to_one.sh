@@ -1,107 +1,93 @@
 #!/usr/bin/env bash
+#
+# Merge the flow-feature CSV files produced for individual PCAP files.
+#
+# Usage:
+#   ./merge_all_per_pcap_to_one.sh <per_pcap_dir> <output_csv> [gzip_copy]
+#
+# Arguments:
+#   per_pcap_dir  Directory containing the per-PCAP CSV files.
+#   output_csv    Destination of the merged semicolon-separated CSV.
+#   gzip_copy     Optional: 1 to create a compressed copy, 0 otherwise.
+
 set -euo pipefail
 
-OUT_DIR="${OUT_DIR:-/home/jaimeant/iot23_dataset/pipeline_hist/out}"
-PER_PCAP_DIR="${PER_PCAP_DIR:-$OUT_DIR/per_pcap}"
-
-FINAL_CSV="${1:-$OUT_DIR/dataset_final.csv}"
+PER_PCAP_DIR="${1:?Usage: merge_all_per_pcap_to_one.sh <per_pcap_dir> <output_csv> [gzip_copy]}"
+FINAL_CSV="${2:?Usage: merge_all_per_pcap_to_one.sh <per_pcap_dir> <output_csv> [gzip_copy]}"
+GZIP_COPY="${3:-0}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-50}"
 
-# Si quieres además un backup comprimido (recomendado), pon GZIP_COPY=1
-GZIP_COPY="${GZIP_COPY:-0}"   # 0/1
-
 if [[ ! -d "$PER_PCAP_DIR" ]]; then
-  echo "ERROR: no existe PER_PCAP_DIR=$PER_PCAP_DIR" >&2
+  echo "[ERROR] Input directory not found: $PER_PCAP_DIR" >&2
   exit 2
 fi
 
-echo "[INFO] PER_PCAP_DIR=$PER_PCAP_DIR"
-echo "[INFO] FINAL_CSV=$FINAL_CSV"
-echo "[INFO] PROGRESS_EVERY=$PROGRESS_EVERY"
-echo "[INFO] GZIP_COPY=$GZIP_COPY"
+if [[ "$GZIP_COPY" != "0" && "$GZIP_COPY" != "1" ]]; then
+  echo "[ERROR] gzip_copy must be 0 or 1." >&2
+  exit 2
+fi
 
-tmp_out="${FINAL_CSV}.tmp"
-rm -f "$tmp_out"
+temporary_output="${FINAL_CSV}.tmp"
 mkdir -p "$(dirname "$FINAL_CSV")"
+rm -f "$temporary_output"
 
-# Lista todos los CSVs (orden estable)
-mapfile -t CSVs < <(find "$PER_PCAP_DIR" -maxdepth 1 -type f -name "*.csv" | sort)
-
-if (( ${#CSVs[@]} == 0 )); then
-  echo "ERROR: no hay CSVs en $PER_PCAP_DIR" >&2
+mapfile -t csv_files < <(find "$PER_PCAP_DIR" -maxdepth 1 -type f -name "*.csv" | sort)
+if (( ${#csv_files[@]} == 0 )); then
+  echo "[ERROR] No CSV files found in: $PER_PCAP_DIR" >&2
   exit 3
 fi
 
-# Encuentra el primer CSV "bueno" para sacar header
-HEADER_SRC=""
-for f in "${CSVs[@]}"; do
-  # skip vacíos
-  if [[ ! -s "$f" ]]; then
-    continue
-  fi
-  # debe tener al menos 2 líneas (header + 1 data)
-  nlines="$(wc -l < "$f" || echo 0)"
-  if (( nlines >= 2 )); then
-    HEADER_SRC="$f"
+header_source=""
+for file_path in "${csv_files[@]}"; do
+  if [[ -s "$file_path" ]] && (( $(wc -l < "$file_path") >= 2 )); then
+    header_source="$file_path"
     break
   fi
 done
 
-if [[ -z "$HEADER_SRC" ]]; then
-  echo "ERROR: no encuentro ningún CSV con >=2 líneas (todos parecen vacíos o solo header)" >&2
+if [[ -z "$header_source" ]]; then
+  echo "[ERROR] No CSV file contains both a header and data rows." >&2
   exit 4
 fi
 
-echo "[INFO] Header tomado de: $HEADER_SRC"
-head -n 1 "$HEADER_SRC" > "$tmp_out"
+echo "[INFO] Input directory: $PER_PCAP_DIR"
+echo "[INFO] Output CSV: $FINAL_CSV"
+echo "[INFO] Header source: $header_source"
 
-# Merge streaming: append sin header
-ok=0
-skip_empty=0
-skip_header_only=0
-total=${#CSVs[@]}
+head -n 1 "$header_source" > "$temporary_output"
 
-i=0
-for f in "${CSVs[@]}"; do
-  ((i++)) || true
+appended=0
+skipped_empty=0
+skipped_header_only=0
+total_files=${#csv_files[@]}
 
-  if [[ ! -s "$f" ]]; then
-    ((skip_empty++)) || true
+for file_path in "${csv_files[@]}"; do
+  if [[ ! -s "$file_path" ]]; then
+    ((skipped_empty++)) || true
     continue
   fi
 
-  nlines="$(wc -l < "$f" || echo 0)"
-  if (( nlines <= 1 )); then
-    ((skip_header_only++)) || true
+  line_count="$(wc -l < "$file_path" || echo 0)"
+  if (( line_count <= 1 )); then
+    ((skipped_header_only++)) || true
     continue
   fi
 
-  # (Opcional) Comprobar que el header coincide con el header global.
-  # Lo dejamos OFF por velocidad; si quieres activarlo:
-  # if ! head -n 1 "$f" | cmp -s - "$tmp_out"; then
-  #   echo "[WARN] Header distinto en $f -> lo salto"
-  #   continue
-  # fi
+  tail -n +2 "$file_path" >> "$temporary_output"
+  ((appended++)) || true
 
-  tail -n +2 "$f" >> "$tmp_out"
-  ((ok++)) || true
-
-  if (( ok % PROGRESS_EVERY == 0 )); then
-    echo "[PROGRESS] appended=$ok / total_files=$total (iter=$i)  skips: empty=$skip_empty header_only=$skip_header_only"
+  if (( appended % PROGRESS_EVERY == 0 )); then
+    echo "[INFO] Files appended: $appended/$total_files"
   fi
 done
 
-mv -f "$tmp_out" "$FINAL_CSV"
+mv -f "$temporary_output" "$FINAL_CSV"
 
-echo
-echo "[DONE] CSV final creado: $FINAL_CSV"
-echo "[STATS] total_files=$total appended=$ok skipped_empty=$skip_empty skipped_header_only=$skip_header_only"
-echo "[INFO] Líneas totales (incluye header): $(wc -l < "$FINAL_CSV")"
-echo "[INFO] Tamaño: $(du -h "$FINAL_CSV" | awk '{print $1}')"
+echo "[INFO] Merge completed: $FINAL_CSV"
+echo "[INFO] Files appended=$appended | empty=$skipped_empty | header_only=$skipped_header_only"
+echo "[INFO] Total output lines: $(wc -l < "$FINAL_CSV")"
 
 if [[ "$GZIP_COPY" == "1" ]]; then
-  echo
-  echo "[INFO] Generando copia comprimida (backup): ${FINAL_CSV}.gz"
   gzip -c "$FINAL_CSV" > "${FINAL_CSV}.gz"
-  echo "[DONE] Backup gzip: ${FINAL_CSV}.gz  size=$(du -h "${FINAL_CSV}.gz" | awk '{print $1}')"
+  echo "[INFO] Compressed copy created: ${FINAL_CSV}.gz"
 fi
