@@ -1,82 +1,103 @@
 #!/usr/bin/env python3
+"""Balance the reduced binary dataset using SMOTE.
+
+SMOTE is applied to the benign class until both binary classes contain the
+requested number of samples. The protocol field is encoded numerically before
+resampling.
+
+Example:
+    python data_processing/apply_smote_binary_with_proto.py \\
+        --input results/datasets/dataset_binary_reduced_before_smote.csv \\
+        --output results/datasets/dataset_binary_balanced_100k_per_class_withproto.csv
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
 import pandas as pd
 from imblearn.over_sampling import SMOTE
 
-INPUT = "pipeline_hist/out/dataset_binary_reduced_before_smote.csv"
-OUTPUT = "pipeline_hist/out/dataset_binary_balanced_100k_per_class_withproto.csv"
-
-TARGET = 100000
-SEED = 42
 
 FINAL_CLASSES = ["Benign", "Attack"]
 
-def proto_to_int(s):
-    s = s.astype(str).str.strip().str.lower()
-    return s.map({
-        "tcp": 6,
-        "udp": 17,
-        "icmp": 1
-    }).fillna(-1).astype("int16")
 
-def main():
-    print("Loading reduced binary dataset...")
-    df = pd.read_csv(INPUT, sep=";")
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=Path, required=True, help="Input reduced binary CSV.")
+    parser.add_argument("--output", type=Path, required=True, help="Output balanced binary CSV.")
+    parser.add_argument("--target", type=int, default=100_000,
+                        help="Target number of rows per class.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    return parser.parse_args()
 
-    if "label" not in df.columns:
-        raise RuntimeError("No existe la columna label.")
 
-    if "proto" not in df.columns:
-        raise RuntimeError("No existe la columna proto.")
-
-    df["label"] = df["label"].astype(str).str.strip()
-    df = df[df["label"].isin(FINAL_CLASSES)].copy()
-
-    print("\nInitial distribution:")
-    print(df["label"].value_counts())
-
-    # proto -> numérico, igual que en el multiclase final
-    df["proto"] = proto_to_int(df["proto"])
-
-    # No usamos identificadores ni campos auxiliares como features
-    drop_cols = ["flow_id", "capture"]
-    X = df.drop(columns=drop_cols + ["label"], errors="ignore")
-    y = df["label"]
-
-    # Conversión robusta a numérico
-    X = X.apply(pd.to_numeric, errors="coerce").fillna(0)
-
-    print("\nApplying SMOTE to Benign...")
-
-    smote = SMOTE(
-        sampling_strategy={"Benign": TARGET},
-        random_state=SEED,
-        k_neighbors=3
+def protocol_to_integer(series: pd.Series) -> pd.Series:
+    """Encode supported protocol names as their IP protocol numbers."""
+    return (
+        series.astype(str).str.strip().str.lower()
+        .map({"tcp": 6, "udp": 17, "icmp": 1})
+        .fillna(-1)
+        .astype("int16")
     )
 
-    X_res, y_res = smote.fit_resample(X, y)
 
-    out = pd.DataFrame(X_res, columns=X.columns)
-    out["label"] = y_res
+def main() -> None:
+    """Create the balanced binary dataset."""
+    args = parse_args()
+    if not args.input.exists():
+        raise FileNotFoundError(f"Input dataset not found: {args.input}")
 
-    # Seguridad: dejar exactamente TARGET por clase
+    dataframe = pd.read_csv(args.input, sep=";")
+    for required_column in ("label", "proto"):
+        if required_column not in dataframe.columns:
+            raise ValueError(f"Required column not found: {required_column}")
+
+    dataframe["label"] = dataframe["label"].astype(str).str.strip()
+    dataframe = dataframe[dataframe["label"].isin(FINAL_CLASSES)].copy()
+    dataframe["proto"] = protocol_to_integer(dataframe["proto"])
+
+    features = dataframe.drop(columns=["flow_id", "capture", "label"], errors="ignore")
+    labels = dataframe["label"]
+    features = features.apply(pd.to_numeric, errors="coerce").fillna(0)
+
+    print("[INFO] Initial class distribution:")
+    print(labels.value_counts())
+
+    smote = SMOTE(
+        sampling_strategy={"Benign": args.target},
+        random_state=args.seed,
+        k_neighbors=3,
+    )
+    resampled_features, resampled_labels = smote.fit_resample(features, labels)
+
+    balanced = pd.DataFrame(resampled_features, columns=features.columns)
+    balanced["label"] = resampled_labels
+
     final_parts = []
-    for cls in FINAL_CLASSES:
-        part = out[out["label"] == cls]
-        if len(part) < TARGET:
-            raise RuntimeError(f"La clase {cls} quedó con {len(part)} muestras (< {TARGET}).")
-        if len(part) > TARGET:
-            part = part.sample(n=TARGET, random_state=SEED)
-        final_parts.append(part)
+    for class_name in FINAL_CLASSES:
+        class_rows = balanced[balanced["label"] == class_name]
+        if len(class_rows) < args.target:
+            raise RuntimeError(
+                f"Class {class_name} has {len(class_rows)} rows after SMOTE; "
+                f"{args.target} were requested."
+            )
+        if len(class_rows) > args.target:
+            class_rows = class_rows.sample(n=args.target, random_state=args.seed)
+        final_parts.append(class_rows)
 
-    final = pd.concat(final_parts, ignore_index=True)
-    final = final.sample(frac=1, random_state=SEED).reset_index(drop=True)
+    final_dataset = pd.concat(final_parts, ignore_index=True)
+    final_dataset = final_dataset.sample(frac=1, random_state=args.seed).reset_index(drop=True)
 
-    print("\nFinal distribution:")
-    print(final["label"].value_counts())
-    print("\nFinal shape:", final.shape)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    final_dataset.to_csv(args.output, sep=";", index=False)
 
-    final.to_csv(OUTPUT, sep=";", index=False)
-    print("\nSaved:", OUTPUT)
+    print("[INFO] Final class distribution:")
+    print(final_dataset["label"].value_counts())
+    print(f"[INFO] Balanced binary dataset created: {args.output}")
+
 
 if __name__ == "__main__":
     main()
