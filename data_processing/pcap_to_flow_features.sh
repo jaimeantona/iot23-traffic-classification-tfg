@@ -1,38 +1,52 @@
 #!/usr/bin/env bash
+#
+# Convert a PCAP file into a semicolon-separated flow feature CSV.
+#
+# Usage:
+#   ./pcap_to_flow_features.sh <input.pcap> <output.csv> <log_file>
+#
+# Requirements:
+#   tshark, awk, and packets_to_flow_features.awk in the same directory.
+
 set -euo pipefail
 
-# Uso:
-#   pcap_to_flow_features.sh <pcap> <out_csv> <log_file>
-PCAP="${1:?PCAP requerido}"
-OUT_CSV="${2:?OUT_CSV requerido}"
-LOG="${3:?LOG requerido}"
+PCAP="${1:?Usage: pcap_to_flow_features.sh <input.pcap> <output.csv> <log_file>}"
+OUT_CSV="${2:?Usage: pcap_to_flow_features.sh <input.pcap> <output.csv> <log_file>}"
+LOG_FILE="${3:?Usage: pcap_to_flow_features.sh <input.pcap> <output.csv> <log_file>}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 AWK_SCRIPT="$SCRIPT_DIR/packets_to_flow_features.awk"
 
-echo "[INFO] PCAP=$PCAP"            >  "$LOG"
-echo "[INFO] OUT_CSV=$OUT_CSV"      >> "$LOG"
-echo "[INFO] AWK_SCRIPT=$AWK_SCRIPT">> "$LOG"
+mkdir -p "$(dirname "$OUT_CSV")" "$(dirname "$LOG_FILE")"
 
-# Checks rápidos
+{
+  echo "[INFO] Input PCAP: $PCAP"
+  echo "[INFO] Output CSV: $OUT_CSV"
+  echo "[INFO] AWK feature extractor: $AWK_SCRIPT"
+} > "$LOG_FILE"
+
 if [[ ! -f "$PCAP" ]]; then
-  echo "[ERROR] No existe PCAP: $PCAP" >> "$LOG"
+  echo "[ERROR] Input PCAP file not found: $PCAP" >> "$LOG_FILE"
   exit 2
 fi
+
 if [[ ! -f "$AWK_SCRIPT" ]]; then
-  echo "[ERROR] No existe AWK script: $AWK_SCRIPT" >> "$LOG"
+  echo "[ERROR] AWK feature extractor not found: $AWK_SCRIPT" >> "$LOG_FILE"
   exit 2
 fi
-command -v tshark >/dev/null 2>&1 || { echo "[ERROR] tshark no está instalado/en PATH" >> "$LOG"; exit 2; }
-command -v awk    >/dev/null 2>&1 || { echo "[ERROR] awk no está instalado/en PATH" >> "$LOG"; exit 2; }
 
-# Asegura carpeta destino
-mkdir -p "$(dirname "$OUT_CSV")"
+command -v tshark >/dev/null 2>&1 || {
+  echo "[ERROR] tshark is not installed or is not available in PATH." >> "$LOG_FILE"
+  exit 2
+}
 
-echo "[INFO] Ejecutando tshark | awk ..." >> "$LOG"
+command -v awk >/dev/null 2>&1 || {
+  echo "[ERROR] awk is not installed or is not available in PATH." >> "$LOG_FILE"
+  exit 2
+}
 
-# Importante: NO usamos -E separator=, si luego AWK espera coma.
-# Aquí usamos coma y AWK FS="," como en tu script.
+echo "[INFO] Extracting packet fields and aggregating flows." >> "$LOG_FILE"
+
 tshark -r "$PCAP" \
   -Y "ip && (tcp || udp)" \
   -T fields \
@@ -48,14 +62,13 @@ tshark -r "$PCAP" \
   -e udp.dstport \
   -e frame.len \
   -e ip.proto \
-  2>>"$LOG" \
-| awk -f "$AWK_SCRIPT" \
-  > "$OUT_CSV"
+  2>> "$LOG_FILE" \
+| awk -f "$AWK_SCRIPT" > "$OUT_CSV"
 
-# Sanity check salida
 if [[ ! -s "$OUT_CSV" ]]; then
-  echo "[ERROR] OUT_CSV vacío o no creado: $OUT_CSV" >> "$LOG"
+  echo "[ERROR] Output CSV was not created or is empty: $OUT_CSV" >> "$LOG_FILE"
   exit 3
 fi
 
-echo "[INFO] OK: generado $(wc -l < "$OUT_CSV") líneas" >> "$LOG"
+line_count="$(wc -l < "$OUT_CSV" | tr -d ' ')"
+echo "[INFO] Completed successfully. Output lines: $line_count" >> "$LOG_FILE"
