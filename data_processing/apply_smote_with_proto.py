@@ -1,97 +1,118 @@
 #!/usr/bin/env python3
+"""Balance the reduced five-class dataset using SMOTE.
+
+The input dataset is expected to have previously reduced majority classes. SMOTE
+is applied to Benign and C&C until the requested number of samples per class is
+reached. The protocol field is encoded numerically before resampling.
+
+Example:
+    python data_processing/apply_smote_with_proto.py \\
+        --input results/datasets/dataset_reduced_before_smote.csv \\
+        --output results/datasets/dataset_balanced_100k_per_class_withproto.csv
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
 import pandas as pd
-import numpy as np
-from collections import Counter
 from imblearn.over_sampling import SMOTE
 
-INPUT = "pipeline_hist/out/dataset_reduced_before_smote.csv"
-OUTPUT = "pipeline_hist/out/dataset_balanced_100k_per_class_withproto.csv"
-
-TARGET = 100000
-SEED = 42
 
 FINAL_CLASSES = [
     "Benign",
     "C&C",
     "DDoS",
     "Okiru",
-    "PartOfAHorizontalPortScan"
+    "PartOfAHorizontalPortScan",
 ]
 
-def proto_to_int(s):
-    s = s.astype(str).str.strip().str.lower()
-    return s.map({
-        "tcp":6,
-        "udp":17,
-        "icmp":1
-    }).fillna(-1).astype("int16")
 
-def clean_label(s):
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=Path, required=True, help="Input reduced CSV.")
+    parser.add_argument("--output", type=Path, required=True, help="Output balanced CSV.")
+    parser.add_argument("--target", type=int, default=100_000,
+                        help="Target number of rows per class.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    return parser.parse_args()
+
+
+def protocol_to_integer(series: pd.Series) -> pd.Series:
+    """Encode supported protocol names as their IP protocol numbers."""
     return (
-        s.astype(str)
-        .str.replace("\n","",regex=False)
-        .str.replace("\r","",regex=False)
-        .str.strip()
-        .replace({
-            "C&C-Torii":"C&C",
-            "#":"Benign"
-        })
+        series.astype(str).str.strip().str.lower()
+        .map({"tcp": 6, "udp": 17, "icmp": 1})
+        .fillna(-1)
+        .astype("int16")
     )
 
-def main():
 
-    print("Loading dataset...")
-    df = pd.read_csv(INPUT, sep=";")
+def clean_labels(series: pd.Series) -> pd.Series:
+    """Consolidate label variants before class balancing."""
+    return (
+        series.astype(str)
+        .str.replace("\n", "", regex=False)
+        .str.replace("\r", "", regex=False)
+        .str.strip()
+        .replace({"C&C-Torii": "C&C", "#": "Benign"})
+    )
 
-    df["label"] = clean_label(df["label"])
-    df = df[df["label"].isin(FINAL_CLASSES)]
 
-    print("Initial distribution:")
-    print(df["label"].value_counts())
+def main() -> None:
+    """Create the balanced five-class dataset."""
+    args = parse_args()
+    if not args.input.exists():
+        raise FileNotFoundError(f"Input dataset not found: {args.input}")
 
-    # proto → numeric
-    df["proto"] = proto_to_int(df["proto"])
+    dataframe = pd.read_csv(args.input, sep=";")
+    for required_column in ("label", "proto"):
+        if required_column not in dataframe.columns:
+            raise ValueError(f"Required column not found: {required_column}")
 
-    # separar features
-    drop_cols = ["flow_id","capture"]
-    X = df.drop(columns=drop_cols + ["label"], errors="ignore")
-    y = df["label"]
+    dataframe["label"] = clean_labels(dataframe["label"])
+    dataframe = dataframe[dataframe["label"].isin(FINAL_CLASSES)].copy()
+    dataframe["proto"] = protocol_to_integer(dataframe["proto"])
 
-    # numeric conversion
-    X = X.apply(pd.to_numeric, errors="coerce").fillna(0)
+    features = dataframe.drop(columns=["flow_id", "capture", "label"], errors="ignore")
+    labels = dataframe["label"]
+    features = features.apply(pd.to_numeric, errors="coerce").fillna(0)
 
-    print("\nApplying SMOTE...")
+    print("[INFO] Initial class distribution:")
+    print(labels.value_counts())
 
     smote = SMOTE(
-        sampling_strategy={
-            "Benign":TARGET,
-            "C&C":TARGET
-        },
-        random_state=SEED,
-        k_neighbors=3
+        sampling_strategy={"Benign": args.target, "C&C": args.target},
+        random_state=args.seed,
+        k_neighbors=3,
     )
+    resampled_features, resampled_labels = smote.fit_resample(features, labels)
 
-    X_res, y_res = smote.fit_resample(X, y)
+    balanced = pd.DataFrame(resampled_features, columns=features.columns)
+    balanced["label"] = resampled_labels
 
-    out = pd.DataFrame(X_res, columns=X.columns)
-    out["label"] = y_res
+    final_parts = []
+    for class_name in FINAL_CLASSES:
+        class_rows = balanced[balanced["label"] == class_name]
+        if len(class_rows) < args.target:
+            raise RuntimeError(
+                f"Class {class_name} has {len(class_rows)} rows after SMOTE; "
+                f"{args.target} were requested."
+            )
+        if len(class_rows) > args.target:
+            class_rows = class_rows.sample(n=args.target, random_state=args.seed)
+        final_parts.append(class_rows)
 
-    # recortar por seguridad
-    final = []
-    for c in FINAL_CLASSES:
-        part = out[out["label"] == c]
-        if len(part) > TARGET:
-            part = part.sample(n=TARGET, random_state=SEED)
-        final.append(part)
+    final_dataset = pd.concat(final_parts, ignore_index=True)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    final_dataset.to_csv(args.output, sep=";", index=False)
 
-    final = pd.concat(final)
+    print("[INFO] Final class distribution:")
+    print(final_dataset["label"].value_counts())
+    print(f"[INFO] Balanced dataset created: {args.output}")
 
-    print("\nFinal distribution:")
-    print(final["label"].value_counts())
-
-    final.to_csv(OUTPUT, sep=";", index=False)
-
-    print("\nSaved:", OUTPUT)
 
 if __name__ == "__main__":
     main()
