@@ -1,142 +1,138 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""Build the reduced five-class dataset before SMOTE balancing.
 
+All samples from the minority classes Benign and C&C are retained. The three
+larger classes are reduced through reservoir sampling to a configurable target
+size. Label variants are consolidated before sampling.
+
+Example:
+    python data_processing/build_reduced_dataset_streaming.py \\
+        --input results/datasets/dataset_expanded_labeled_raw_byScenario_streaming.csv \\
+        --output results/datasets/dataset_reduced_before_smote.csv \\
+        --target 100000
+"""
+
+from __future__ import annotations
+
+import argparse
 import csv
 import random
+from collections import Counter
 from pathlib import Path
 
-INPUT_FILE = Path("pipeline_hist/out/dataset_expanded_labeled_raw_byScenario_streaming.csv")
-OUTPUT_FILE = Path("pipeline_hist/out/dataset_reduced_before_smote.csv")
 
-# Clases finales
 PORTSCAN = "PartOfAHorizontalPortScan"
 OKIRU = "Okiru"
 DDOS = "DDoS"
 CC = "C&C"
 BENIGN = "Benign"
+FINAL_CLASSES = (BENIGN, CC, DDOS, OKIRU, PORTSCAN)
 
-# Downsample objetivo para clases grandes
-K = 100_000
-RANDOM_SEED = 42
 
-def reservoir_update(reservoir, item, seen_count, k, rng):
-    """
-    Reservoir sampling:
-      - reservoir: list con muestras
-      - item: fila actual (list)
-      - seen_count: cuántos elementos de esa clase hemos visto (incluyendo este)
-    """
-    if len(reservoir) < k:
-        reservoir.append(item)
-    else:
-        j = rng.randrange(seen_count)  # 0..seen_count-1
-        if j < k:
-            reservoir[j] = item
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=Path, required=True, help="Input labelled CSV.")
+    parser.add_argument("--output", type=Path, required=True, help="Output reduced CSV.")
+    parser.add_argument("--target", type=int, default=100_000,
+                        help="Maximum samples retained for large classes.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    return parser.parse_args()
 
-def main():
-    if not INPUT_FILE.exists():
-        raise SystemExit(f"No existe: {INPUT_FILE}")
 
-    rng = random.Random(RANDOM_SEED)
+def reservoir_update(
+    reservoir: list[list[str]],
+    row: list[str],
+    seen_count: int,
+    target: int,
+    random_generator: random.Random,
+) -> None:
+    """Maintain a uniform sample of at most ``target`` observed rows."""
+    if len(reservoir) < target:
+        reservoir.append(row)
+        return
 
-    # Reservorios para clases grandes
-    res_portscan = []
-    res_okiru = []
-    res_ddos = []
-    seen = {PORTSCAN: 0, OKIRU: 0, DDOS: 0}
+    position = random_generator.randrange(seen_count)
+    if position < target:
+        reservoir[position] = row
 
-    # Para clases pequeñas (guardamos todas; son pocas)
-    rows_benign = []
-    rows_cc = []
 
-    # Conteos (para imprimir al final)
-    counts_after = {BENIGN: 0, CC: 0, DDOS: 0, OKIRU: 0, PORTSCAN: 0}
-    counts_seen_raw = {}
+def consolidate_label(label: str) -> str:
+    """Map label variants into the final classes used in the experiment."""
+    if label == "C&C-Torii":
+        return CC
+    if label == "#":
+        return BENIGN
+    return label
 
-    with INPUT_FILE.open("r", newline="") as f:
-        reader = csv.reader(f, delimiter=";")
+
+def main() -> None:
+    """Create the reduced five-class dataset."""
+    args = parse_args()
+    if not args.input.exists():
+        raise FileNotFoundError(f"Input dataset not found: {args.input}")
+
+    rng = random.Random(args.seed)
+    reservoirs = {DDOS: [], OKIRU: [], PORTSCAN: []}
+    seen_large = Counter()
+    retained_small = {BENIGN: [], CC: []}
+    seen_counts: Counter[str] = Counter()
+
+    with args.input.open("r", newline="", encoding="utf-8", errors="replace") as input_file:
+        reader = csv.reader(input_file, delimiter=";")
         header = next(reader)
 
-        # localizar índice de label
-        try:
-            label_idx = header.index("label")
-        except ValueError:
-            raise SystemExit("No encuentro columna 'label' en el CSV de entrada.")
+        if "label" not in header:
+            raise ValueError("The input dataset must contain a 'label' column.")
+        label_index = header.index("label")
 
         for row in reader:
-            if not row:
+            if not row or len(row) <= label_index:
                 continue
 
-            # label original
-            label = row[label_idx].strip()
+            label = consolidate_label(row[label_index].strip())
+            if label not in FINAL_CLASSES:
+                continue
 
-            # Relabels:
-            # - C&C-Torii -> C&C
-            # - # -> Benign
-            if label == "C&C-Torii":
-                label = CC
-            elif label == "#":
-                label = BENIGN
+            row[label_index] = label
+            seen_counts[label] += 1
 
-            # Guardar label relabelado en la fila
-            row[label_idx] = label
-
-            # (solo para info)
-            counts_seen_raw[label] = counts_seen_raw.get(label, 0) + 1
-
-            # Distribución / muestreo
-            if label == BENIGN:
-                rows_benign.append(row)
-                counts_after[BENIGN] += 1
-
-            elif label == CC:
-                rows_cc.append(row)
-                counts_after[CC] += 1
-
-            elif label == DDOS:
-                seen[DDOS] += 1
-                reservoir_update(res_ddos, row, seen[DDOS], K, rng)
-
-            elif label == OKIRU:
-                seen[OKIRU] += 1
-                reservoir_update(res_okiru, row, seen[OKIRU], K, rng)
-
-            elif label == PORTSCAN:
-                seen[PORTSCAN] += 1
-                reservoir_update(res_portscan, row, seen[PORTSCAN], K, rng)
-
+            if label in retained_small:
+                retained_small[label].append(row)
             else:
-                # Si apareciese alguna etiqueta inesperada, la ignoramos
-                # (o puedes imprimir warning)
-                pass
+                seen_large[label] += 1
+                reservoir_update(reservoirs[label], row, seen_large[label], args.target, rng)
 
-    # Conteos finales de grandes (reservorio)
-    counts_after[DDOS] = len(res_ddos)
-    counts_after[OKIRU] = len(res_okiru)
-    counts_after[PORTSCAN] = len(res_portscan)
+    output_rows = (
+        retained_small[BENIGN]
+        + retained_small[CC]
+        + reservoirs[DDOS]
+        + reservoirs[OKIRU]
+        + reservoirs[PORTSCAN]
+    )
 
-    # Escribir dataset reducido
-    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with OUTPUT_FILE.open("w", newline="") as out:
-        writer = csv.writer(out, delimiter=";")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with args.output.open("w", newline="", encoding="utf-8") as output_file:
+        writer = csv.writer(output_file, delimiter=";")
         writer.writerow(header)
+        writer.writerows(output_rows)
 
-        # Escribimos: benign + cc + (reservorios grandes)
-        # (si prefieres mezclar, luego lo barajamos en el script 2)
-        writer.writerows(rows_benign)
-        writer.writerows(rows_cc)
-        writer.writerows(res_ddos)
-        writer.writerows(res_okiru)
-        writer.writerows(res_portscan)
+    retained_counts = {
+        BENIGN: len(retained_small[BENIGN]),
+        CC: len(retained_small[CC]),
+        DDOS: len(reservoirs[DDOS]),
+        OKIRU: len(reservoirs[OKIRU]),
+        PORTSCAN: len(reservoirs[PORTSCAN]),
+    }
 
-    print("✅ Reduced dataset saved:", OUTPUT_FILE)
-    print("\nDistribución reducida (antes de SMOTE):")
-    for k, v in counts_after.items():
-        print(f"{k:25s} {v}")
+    print(f"[INFO] Reduced dataset created: {args.output}")
+    print("[INFO] Observed samples after label consolidation:")
+    for label in FINAL_CLASSES:
+        print(f"  {label:30s} {seen_counts[label]}")
+    print("[INFO] Retained samples before SMOTE:")
+    for label in FINAL_CLASSES:
+        print(f"  {label:30s} {retained_counts[label]}")
 
-    print("\nInfo (cuántas filas vistas por clase tras relabel, antes de muestrear):")
-    for k, v in sorted(counts_seen_raw.items(), key=lambda x: x[1], reverse=True):
-        print(f"{k:25s} {v}")
 
 if __name__ == "__main__":
     main()
