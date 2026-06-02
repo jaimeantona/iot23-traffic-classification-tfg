@@ -14,7 +14,7 @@ training/          Entrenamiento y evaluación de modelos
 figures/           Generación de figuras utilizadas en la memoria
 ```
 
-La carpeta `data_processing/` contiene los scripts utilizados para:
+La carpeta "data_processing/" contiene los scripts utilizados para:
 
 * dividir capturas grandes en fragmentos manejables;
 * extraer características desde PCAP mediante `tshark` y `awk`;
